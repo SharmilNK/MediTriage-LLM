@@ -70,8 +70,17 @@ def map_to_target_schema(row: Dict) -> Dict:
 
     Extra keys (e.g. accepted_department) are ignored for training.
     """
-    raw_output = row["output"]
-    parsed = json.loads(raw_output)
+    raw_output = (row.get("output") or "").strip()
+    if not raw_output:
+        raise ValueError("Empty output field")
+
+    try:
+        parsed = json.loads(raw_output)
+    except json.JSONDecodeError as e:
+        preview_q = (row.get("questions") or "")[:80].replace("\n", " ")
+        raise ValueError(
+            f"Could not parse output JSON for row with questions='{preview_q}...'"
+        ) from e
 
     # Symptoms might be an array already; if not, coerce to list.
     symptoms = parsed.get("symptoms", [])
@@ -140,12 +149,18 @@ def main():
 
     # Convert each sample to instruction-tuning format
     formatted: List[Dict] = []
-    for row in raw_data:
-        target = map_to_target_schema(row)
+    skipped = 0
+    for idx, row in enumerate(raw_data):
+        try:
+            target = map_to_target_schema(row)
+        except ValueError as e:
+            skipped += 1
+            print(f"Skipping row {idx} due to parse error: {e}")
+            continue
         pair = format_instruction_pair(row["questions"], target)
         formatted.append(pair)
 
-    print(f"Formatted {len(formatted)} instruction pairs")
+    print(f"Formatted {len(formatted)} instruction pairs (skipped {skipped})")
 
     # Stratified 75/15/15 split
     train_data, val_data, test_data = stratified_split_3way(

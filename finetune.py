@@ -6,11 +6,12 @@ medical triage dataset. Uses SFTTrainer from the trl library.
 
 Input:
     data/processed/train.json  (from prepare_dataset.py)
-    data/processed/val.json    (for validation / early stopping)
+    data/processed/val.json    (for validation)
 
 Output:
     models/meditriage-mistral-lora/  (LoRA adapter weights)
-    models/logs/training_log.json    (train/val/test losses for plotting)
+    models/logs/training_log.json    (train/val losses for plotting)
+    data/outputs/plots/train_val_loss.png
 """
 
 import json
@@ -30,9 +31,9 @@ from trl import SFTTrainer
 MODEL_ID = "mistralai/Mistral-7B-Instruct-v0.3"
 TRAIN_PATH = "data/processed/train.json"
 VAL_PATH = "data/processed/val.json"
-TEST_PATH = "data/processed/test.json"
 OUTPUT_DIR = "models/meditriage-mistral-lora"
 LOGGING_DIR = "models/logs"
+PLOTS_DIR = "data/outputs/plots"
 
 # ── LoRA Config ────────────────────────────────────────────────────────
 LORA_R = 16
@@ -106,11 +107,11 @@ def main():
     # Load data
     train_dataset = load_dataset_from_path(TRAIN_PATH)
     val_dataset = load_dataset_from_path(VAL_PATH)
-    test_dataset = load_dataset_from_path(TEST_PATH)
+    #test_dataset = load_dataset_from_path(TEST_PATH)
     print(
         f"Training samples: {len(train_dataset)} | "
         f"Val samples: {len(val_dataset)} | "
-        f"Test samples: {len(test_dataset)}"
+        #f"Test samples: {len(test_dataset)}"
     )
 
     # Load model + tokenizer + LoRA
@@ -120,6 +121,10 @@ def main():
     os.makedirs(LOGGING_DIR, exist_ok=True)
 
     # Training arguments
+    # Note: the transformers version in Colab may not support newer
+    # fields like `evaluation_strategy` / `load_best_model_at_end`,
+    # so we keep this config minimal and call `trainer.evaluate`
+    # manually after training.
     training_args = TrainingArguments(
         output_dir=OUTPUT_DIR,
         num_train_epochs=NUM_EPOCHS,
@@ -131,56 +136,78 @@ def main():
         bf16=True,
         logging_dir=LOGGING_DIR,
         logging_steps=10,
-        evaluation_strategy="epoch",
         save_strategy="epoch",
         save_total_limit=2,
-        load_best_model_at_end=True,
-        metric_for_best_model="eval_loss",
-        greater_is_better=False,
         seed=SEED,
         report_to="none",
         optim="paged_adamw_8bit",
         gradient_checkpointing=True,
-        gradient_checkpointing_kwargs={"use_reentrant": False},
+        remove_unused_columns=False,
     )
 
-    # SFTTrainer handles chat template formatting automatically
+    # SFTTrainer handles chat template formatting automatically.
+    # Older trl versions don't support `max_seq_length` in the ctor,
+    # so we only pass the arguments they accept.
     trainer = SFTTrainer(
         model=model,
         args=training_args,
         train_dataset=train_dataset,
         eval_dataset=val_dataset,
         processing_class=tokenizer,
-        max_seq_length=MAX_SEQ_LENGTH,
     )
 
     # Train
     print("Starting fine-tuning...")
     train_result = trainer.train()
 
-    # Evaluate on validation and test sets for loss curves
-    print("Evaluating best model on validation set...")
-    val_metrics = trainer.evaluate(eval_dataset=val_dataset, metric_key_prefix="eval")
+    # Evaluate on validation set for loss curves.
+    # Important: do NOT pass eval_dataset here; SFTTrainer has already
+    # prepared its own eval_dataset internally, and passing a raw
+    # Dataset confuses the Trainer's column handling on older versions.
+    print("Evaluating model on validation set...")
+    val_metrics = trainer.evaluate(metric_key_prefix="eval")
     print(val_metrics)
-
-    print("Evaluating best model on test set...")
-    test_metrics = trainer.evaluate(
-        eval_dataset=test_dataset,
-        metric_key_prefix="test",
-    )
-    print(test_metrics)
-
     # Save training / evaluation metrics to a JSON log for plotting
     metrics_log = {
         "train_metrics": train_result.metrics,
         "val_metrics": val_metrics,
-        "test_metrics": test_metrics,
         "history": trainer.state.log_history,
     }
     metrics_path = os.path.join(LOGGING_DIR, "training_log.json")
     with open(metrics_path, "w", encoding="utf-8") as f:
         json.dump(metrics_log, f, indent=2)
     print(f"Saved training log to {metrics_path}")
+
+    # Save loss plots for later inspection
+    try:
+        import matplotlib.pyplot as plt  # type: ignore
+
+        os.makedirs(PLOTS_DIR, exist_ok=True)
+        history = trainer.state.log_history
+
+        steps = [h["step"] for h in history if "loss" in h]
+        train_losses = [h["loss"] for h in history if "loss" in h]
+        val_points = [(h["step"], h["eval_loss"]) for h in history if "eval_loss" in h]
+
+        plt.figure(figsize=(6, 4))
+        if steps and train_losses:
+            plt.plot(steps, train_losses, label="train_loss")
+        if val_points:
+            val_steps, val_losses = zip(*val_points)
+            plt.plot(val_steps, val_losses, "o-", label="val_loss")
+        plt.xlabel("step")
+        plt.ylabel("loss")
+        plt.title("Training vs Validation Loss")
+        plt.legend()
+        plt.grid(True)
+
+        plot_path = os.path.join(PLOTS_DIR, "train_val_loss.png")
+        plt.tight_layout()
+        plt.savefig(plot_path)
+        plt.close()
+        print(f"Saved loss plot to {plot_path}")
+    except Exception as e:  # pragma: no cover
+        print(f"Could not generate loss plot: {e}")
 
     # Save the LoRA adapter (not the full model)
     print(f"Saving LoRA adapter to {OUTPUT_DIR}")
