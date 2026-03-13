@@ -1,23 +1,31 @@
 """
 prepare_dataset.py
 
-Loads raw_dataset.json, maps fields to the target triage JSON schema,
+Loads finetuning_data.csv, maps fields to the target triage JSON schema,
 formats each sample as a Mistral Instruct chat-template pair, and
-performs an 80/20 stratified train/test split.
+performs a 75/15/15 stratified train/val/test split.
+
+Input:
+    data/raw/finetuning_data.csv  (columns: questions, output)
 
 Output:
     data/processed/train.json
+    data/processed/val.json
     data/processed/test.json
 """
 
+import csv
 import json
 import os
 import random
+from typing import List, Dict, Tuple
 
 SEED = 42
-TRAIN_RATIO = 0.8
-RAW_PATH = "data/raw/raw_dataset.json"
+TRAIN_RATIO = 0.75
+VAL_RATIO = 0.15
+RAW_PATH = "data/raw/finetuning_data.csv"
 TRAIN_PATH = "data/processed/train.json"
+VAL_PATH = "data/processed/val.json"
 TEST_PATH = "data/processed/test.json"
 
 SYSTEM_PROMPT = (
@@ -28,23 +36,58 @@ SYSTEM_PROMPT = (
 )
 
 
-def load_raw_data(path: str) -> list[dict]:
-    with open(path, "r") as f:
-        return json.load(f)
+def load_raw_data(path: str) -> List[Dict]:
+    """
+    Load finetuning_data.csv into a list of dict rows.
+
+    Expected columns:
+        - questions: free-text patient message
+        - output: JSON string with at least
+          department, symptoms, condition, sentiment, urgency_level
+    """
+    rows: List[Dict] = []
+    with open(path, newline="", encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            rows.append(row)
+    return rows
 
 
-def map_to_target_schema(sample: dict) -> dict:
-    """Extract and remap fields to the target output schema."""
+def map_to_target_schema(row: Dict) -> Dict:
+    """
+    Map a CSV row to the target triage JSON schema.
+
+    The `output` column is expected to be a JSON object string like:
+
+        {
+          "department": "Pharmacology",
+          "accepted_department": ["Pharmacology", "Internal Medicine", "Infectious Disease"],
+          "symptoms": [],
+          "condition": "Unknown",
+          "sentiment": "Curious",
+          "urgency_level": "Low"
+        }
+
+    Extra keys (e.g. accepted_department) are ignored for training.
+    """
+    raw_output = row["output"]
+    parsed = json.loads(raw_output)
+
+    # Symptoms might be an array already; if not, coerce to list.
+    symptoms = parsed.get("symptoms", [])
+    if not isinstance(symptoms, list):
+        symptoms = [symptoms]
+
     return {
-        "department": sample["labels"]["department"],
-        "symptoms": sample["metadata"]["symptoms_used"],
-        "condition": sample["metadata"]["likely_condition"],
-        "sentiment": sample["labels"]["sentiment"],
-        "urgency_level": sample["labels"]["urgency"],
+        "department": parsed["department"],
+        "symptoms": symptoms,
+        "condition": parsed.get("condition", "Unknown"),
+        "sentiment": parsed.get("sentiment", "Unknown"),
+        "urgency_level": parsed["urgency_level"],
     }
 
 
-def format_instruction_pair(patient_message: str, target_json: dict) -> dict:
+def format_instruction_pair(patient_message: str, target_json: Dict) -> Dict:
     """Format as a Mistral Instruct chat-template training example."""
     user_content = f"{SYSTEM_PROMPT}\n\nPatient message: {patient_message}"
     assistant_content = json.dumps(target_json, indent=2)
@@ -60,27 +103,35 @@ def format_instruction_pair(patient_message: str, target_json: dict) -> dict:
     }
 
 
-def stratified_split(data: list[dict], ratio: float, seed: int):
-    """Split data stratified by urgency_level."""
+def stratified_split_3way(
+    data: List[Dict], train_ratio: float, val_ratio: float, seed: int
+) -> Tuple[List[Dict], List[Dict], List[Dict]]:
+    """
+    Stratified 3-way split by urgency_level into train / val / test.
+    """
     rng = random.Random(seed)
 
     # Group by urgency
-    buckets: dict[str, list[dict]] = {}
+    buckets: Dict[str, List[Dict]] = {}
     for item in data:
         key = item["ground_truth"]["urgency_level"]
         buckets.setdefault(key, []).append(item)
 
-    train, test = [], []
+    train, val, test = [], [], []
     for urgency, items in sorted(buckets.items()):
         rng.shuffle(items)
-        split_idx = int(len(items) * ratio)
-        train.extend(items[:split_idx])
-        test.extend(items[split_idx:])
+        n = len(items)
+        n_train = int(n * train_ratio)
+        n_val = int(n * val_ratio)
+        train.extend(items[:n_train])
+        val.extend(items[n_train : n_train + n_val])
+        test.extend(items[n_train + n_val :])
 
     # Shuffle the final lists so urgency groups aren't contiguous
     rng.shuffle(train)
+    rng.shuffle(val)
     rng.shuffle(test)
-    return train, test
+    return train, val, test
 
 
 def main():
@@ -88,21 +139,29 @@ def main():
     print(f"Loaded {len(raw_data)} samples from {RAW_PATH}")
 
     # Convert each sample to instruction-tuning format
-    formatted = []
-    for sample in raw_data:
-        target = map_to_target_schema(sample)
-        pair = format_instruction_pair(sample["patient_message"], target)
+    formatted: List[Dict] = []
+    for row in raw_data:
+        target = map_to_target_schema(row)
+        pair = format_instruction_pair(row["questions"], target)
         formatted.append(pair)
 
     print(f"Formatted {len(formatted)} instruction pairs")
 
-    # Stratified 80/20 split
-    train_data, test_data = stratified_split(formatted, TRAIN_RATIO, SEED)
-    print(f"Train: {len(train_data)} | Test: {len(test_data)}")
+    # Stratified 75/15/15 split
+    train_data, val_data, test_data = stratified_split_3way(
+        formatted, TRAIN_RATIO, VAL_RATIO, SEED
+    )
+    print(
+        f"Train: {len(train_data)} | Val: {len(val_data)} | Test: {len(test_data)}"
+    )
 
     # Print urgency distribution
-    for split_name, split_data in [("Train", train_data), ("Test", test_data)]:
-        dist: dict[str, int] = {}
+    for split_name, split_data in [
+        ("Train", train_data),
+        ("Val", val_data),
+        ("Test", test_data),
+    ]:
+        dist: Dict[str, int] = {}
         for item in split_data:
             u = item["ground_truth"]["urgency_level"]
             dist[u] = dist.get(u, 0) + 1
@@ -110,12 +169,15 @@ def main():
 
     # Save
     os.makedirs(os.path.dirname(TRAIN_PATH), exist_ok=True)
-    with open(TRAIN_PATH, "w") as f:
-        json.dump(train_data, f, indent=2)
-    with open(TEST_PATH, "w") as f:
-        json.dump(test_data, f, indent=2)
+    with open(TRAIN_PATH, "w", encoding="utf-8") as f:
+        json.dump(train_data, f, indent=2, ensure_ascii=False)
+    with open(VAL_PATH, "w", encoding="utf-8") as f:
+        json.dump(val_data, f, indent=2, ensure_ascii=False)
+    with open(TEST_PATH, "w", encoding="utf-8") as f:
+        json.dump(test_data, f, indent=2, ensure_ascii=False)
 
     print(f"Saved train to {TRAIN_PATH}")
+    print(f"Saved val to {VAL_PATH}")
     print(f"Saved test to {TEST_PATH}")
 
 
