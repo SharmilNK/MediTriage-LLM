@@ -1,1 +1,8 @@
 requests
+torch
+transformers
+peft
+trl
+bitsandbytes
+datasets
+accelerate
